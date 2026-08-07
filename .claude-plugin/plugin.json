@@ -1,0 +1,17 @@
+{
+  "name": "todo-harness",
+  "description": "Cross-session TODO backlog enforced by hooks. SessionStart injects the project's open items — numbered, grouped and budget-capped — into context; Stop blocks a session that changed files but left the backlog untouched. The backlog is a plain committed Markdown file, so it is shared with the team through git.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Yasin Mollah"
+  },
+  "license": "MIT",
+  "keywords": [
+    "todo",
+    "backlog",
+    "hooks",
+    "session",
+    "handoff",
+    "context"
+  ]
+}
