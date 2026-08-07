@@ -16,7 +16,7 @@ with the team through git — not stored in anyone's local Claude state.
 ## Install
 
 ```
-/plugin marketplace add <your-org>/todo-harness
+/plugin marketplace add MdYasinMollah/todo-harness
 /plugin install todo-harness
 ```
 
@@ -113,3 +113,7 @@ harness without uninstalling the plugin.
 ## Requirements
 
 Node (any version with ES modules) and git. No dependencies.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE).

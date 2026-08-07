@@ -2,8 +2,10 @@
   "name": "todo-harness",
   "version": "1.0.0",
   "description": "Cross-session TODO backlog for Claude Code, enforced by hooks.",
+  "repository": "https://github.com/MdYasinMollah/todo-harness",
   "owner": {
-    "name": "Yasin Mollah"
+    "name": "mdyasinmollah",
+    "url": "https://github.com/MdYasinMollah"
   },
   "plugins": [
     {
