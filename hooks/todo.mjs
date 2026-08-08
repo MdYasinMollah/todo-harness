@@ -88,15 +88,25 @@ function todoRel(root) {
 // Backlog/Done.
 const IN_PROGRESS_SECTION = `## In Progress
 
-Append-only session locks, keyed by each Backlog item's permanent \`#N\` id
-(assigned once, shown next to the item — never a content hash, so editing an
-item's wording never breaks its lock). Never edit or delete a line here —
-union merge can't reconcile in-place edits across sessions, only unioned
-appends. Formats:
-\`- CLAIM #N session <session-id> <timestamp>\`
+Append-only session locks, keyed by each item's permanent \`#N\` id (one
+shared sequence across Backlog and Done — assigned once, shown next to the
+item, never a content hash, so editing an item's wording never breaks its
+lock). Never edit or delete a line here — union merge can't reconcile
+in-place edits across sessions, only unioned appends. Formats:
+\`- CLAIM #N session <session-id> <timestamp> "optional label"\`
 \`- RELEASE #N session <session-id> <timestamp>\` (optional, only if you stop
 early — a release from your own session cancels your own claim immediately)
+The quoted label is optional but recommended: a future reader sees WHAT was
+claimed, not just who/when — a session id alone answers "who," not "why."
 Locks auto-expire after ${CLAIM_TTL_HOURS} hours with no release needed.
+
+When the item is fully finished (moved to \`## Done\`): delete its CLAIM/
+RELEASE line(s) from here entirely, in the same edit that writes the Done
+entry — the Done entry is now the permanent record, the lock lines are pure
+clutter once resolved. Safe specifically because it's one coordinated edit
+by the session that just finished it, not a routine action or a race with
+anyone. If only pausing an item that's still open, RELEASE but leave the
+pair — it's a progress trail for whoever resumes it next.
 
 If a session that claimed something gets closed, crashes, or is deleted
 before finishing: don't wait out the timeout if you don't have to. The
@@ -136,14 +146,26 @@ shared with the team through git. It is enforced by hooks, not by good intention
   \`docs/TODO.md\` untouched. When blocked: record what's unfinished under \`## Backlog\`,
   move finished work to \`## Done\` with today's date, then finish.
 
-Each Backlog item carries a permanent \`#N\` id, assigned once and never
-reused or renumbered — safe to say "fix #7" in conversation even across
-sessions or days. Running multiple sessions on this repo at once? Before
-starting a Backlog item, append \`- CLAIM #N session <id> <timestamp>\` under
-\`## In Progress\` (the SessionStart message shows the exact line to copy), so
-the other session's next SessionStart hides it instead of duplicating the
-work. Stopping early? Append a matching \`- RELEASE\` line to free it right
-away — otherwise it auto-expires after ${CLAIM_TTL_HOURS}h on its own.
+Every item — Backlog or Done — carries a permanent \`#N\` id from one shared
+sequence, assigned once and never renumbered or reused: safe to say "fix #7"
+across sessions or days even if the item's wording changes later, and no
+second tag format to keep straight. A Backlog item keeps its own number when
+it's completed and moved to Done — it doesn't get relabeled.
+
+Running multiple sessions on this repo at once? Before starting a Backlog
+item, append
+\`- CLAIM #N session <id> <timestamp> "what you're about to do"\` under
+\`## In Progress\` (the SessionStart message shows the exact line to copy; the
+quoted label is optional but recommended — it's what makes the log useful
+later, not just who/when). When it's fully finished, DELETE its CLAIM/
+RELEASE line(s) from \`## In Progress\` entirely, in the same edit that
+writes its \`## Done\` entry — the Done entry is now the permanent record, so
+the lock lines are pure clutter (safe here specifically because it's one
+coordinated edit by the session that just finished it). If only pausing an
+item that's still open, \`RELEASE\` instead but leave the pair in place — a
+progress trail for whoever resumes it next. Abandoning it early? Same rule:
+\`RELEASE\` immediately — the ${CLAIM_TTL_HOURS}h auto-expiry is a crash
+backstop, not a substitute for releasing.
 
 \`.gitattributes\` sets \`merge=union\` on the file so parallel appends don't conflict.
 `
@@ -208,32 +230,76 @@ function renameHeadingOnce(path, fromHeading, toHeading) {
 }
 
 const ID_TAG_RE = /^-\s+`#(\d+)`\s+(.*)$/
-// Same tag, without requiring the leading "- " — for stripping a leftover
-// Backlog id from text that's no longer a bullet's start (see assignDoneIds).
-const ID_TAG_RE_BODY = /^`#\d+`\s+/
+// A CLAIM/RELEASE line, wherever it landed. These belong under
+// `## In Progress`; the same shape appearing under any other heading is a
+// misfiled lock line, not content — see assignIds and strayLockLines.
+const LOCK_LINE_RE = /^-\s*(?:CLAIM|RELEASE)\s+#\d+\s+session\s+/i
 
-// Give every real Backlog bullet a permanent `#N` id — assigned once, never
-// renumbered, so it stays a valid reference (in conversation, in a CLAIM
-// line) even after the item's own wording is edited. Self-healing: also
-// repairs a duplicate id, which can only arise if two sessions each added a
-// brand-new item around the same time and both picked the same next number —
-// a much narrower race than the per-session claim race this whole feature
-// exists to prevent, and one this function fixes automatically on the very
-// next SessionStart rather than needing a real distributed lock.
+// One-time, whole-file rewrite of legacy `#D<n>` (old Done-only) tags onto
+// the unified `#N` scheme, run once before assignIds so it never sees a `#D`
+// tag to worry about. Renumbers using the D-number's own order (D1 = oldest,
+// preserved) so relative history stays readable, offset past whatever `#N`s
+// already exist elsewhere (Backlog) so nothing collides. A plain whole-file
+// regex replace is safe here specifically because `#D<n>` is a closed,
+// unambiguous pattern that appears nowhere else in the file (never inside a
+// CLAIM/RELEASE line, which are always plain `#<n>`).
+function migrateLegacyDoneTags(path) {
+  if (!existsSync(path)) {
+    return false
+  }
+  const content = readFileSync(path, 'utf8')
+  const dNums = [...new Set([...content.matchAll(/`#D(\d+)`/g)].map((m) => Number(m[1])))]
+  if (!dNums.length) {
+    return false
+  }
+  let maxPlain = 0
+  for (const m of content.matchAll(/`#(\d+)`/g)) {
+    maxPlain = Math.max(maxPlain, Number(m[1]))
+  }
+  const remap = new Map()
+  let counter = maxPlain
+  for (const d of dNums.sort((a, b) => a - b)) {
+    counter += 1
+    remap.set(d, counter)
+  }
+  const rewritten = content.replace(
+    /`#D(\d+)`/g,
+    (full, numStr) => `\`#${remap.get(Number(numStr))}\``,
+  )
+  writeFileSync(path, rewritten)
+  return true
+}
+
+// Give every real Backlog/Done bullet a permanent `#N` id — one shared
+// sequence across both sections, not two, so an item that completes just
+// keeps the number it already had instead of getting relabeled. Assigned
+// once, never renumbered, so it stays a valid reference (in conversation, in
+// a CLAIM line) even after the item's own wording is edited. Self-healing:
+// also repairs a duplicate id, which can only arise if two sessions each add
+// a brand-new item (to either section) around the same time and both pick
+// the same next number — a much narrower race than the per-session claim
+// race this whole feature exists to prevent, and one this function fixes
+// automatically on the very next SessionStart rather than needing a real
+// distributed lock.
+//
+// Skips CLAIM/RELEASE-shaped lines wherever they land (not just under Done):
+// tagging one as content would make a misfiled lock line look like a real
+// Backlog/Done entry, inflate the counts, and hide it from strayLockLines.
 //
 // Operates on the `.split(/^## /m)` parts array (not string offsets) so
-// mutating one Backlog section's line lengths can't desync the position of
-// sections after it — the same trick `openItems` uses to survive multiple
+// mutating one section's line lengths can't desync the position of sections
+// after it — the same trick `openItems` uses to survive multiple
 // `## Backlog — <topic>` headings.
-function assignBacklogIds(path) {
+function assignIds(path) {
   if (!existsSync(path)) {
     return false
   }
   const parts = readFileSync(path, 'utf8').split(/^## /m)
+  const isTaggable = (part) => part.startsWith('Backlog') || part.startsWith('Done')
 
   let globalMax = 0
   for (const part of parts) {
-    if (!part.startsWith('Backlog')) {
+    if (!isTaggable(part)) {
       continue
     }
     for (const line of part.split('\n').slice(1)) {
@@ -248,12 +314,18 @@ function assignBacklogIds(path) {
   const usedIds = new Set()
   let counter = globalMax
   const newParts = parts.map((part) => {
-    if (!part.startsWith('Backlog')) {
+    if (!isTaggable(part)) {
       return part
     }
     const lines = part.split('\n')
     const newLines = lines.map((line, i) => {
-      if (i === 0 || !/^- /.test(line) || line.includes('_(nothing yet')) {
+      if (
+        i === 0 ||
+        !/^- /.test(line) ||
+        line.includes('_(nothing yet') ||
+        line.includes('_(completed work') ||
+        LOCK_LINE_RE.test(line)
+      ) {
         return line
       }
       const m = ID_TAG_RE.exec(line)
@@ -274,102 +346,6 @@ function assignBacklogIds(path) {
       return `- \`#${counter}\` ${line.replace(/^-\s+/, '')}`
     })
     return newLines.join('\n')
-  })
-
-  if (!changed) {
-    return false
-  }
-  writeFileSync(path, newParts.join('## '))
-  return true
-}
-
-const DONE_ID_TAG_RE = /^-\s+`#D(\d+)`\s+/
-// A CLAIM/RELEASE line, wherever it landed. These belong under
-// `## In Progress`; the same shape appearing under any other heading is a
-// misfiled lock line, not content — see assignDoneIds and strayLockLines.
-const LOCK_LINE_RE = /^-\s*(?:CLAIM|RELEASE)\s+#\d+\s+session\s+/i
-
-// Tag every Done entry with a permanent `#D<n>`, oldest completed = `#D1`,
-// so "how much is actually done" is a number you can see, not a scroll.
-// A different tag shape than Backlog's `#N` on purpose — a Done id and a
-// Backlog id are never the same kind of reference, and reusing the same
-// counter would make "#2" ambiguous between "backlog item 2" and "the 2nd
-// thing ever finished."
-//
-// Numbering direction: the file lists Done newest-first (by convention), so
-// the newest entry is at the TOP. Untagged entries are always the newest
-// ones — anything already tagged is necessarily older, tagged on some prior
-// run — so the bottom-most untagged entry (closest to the already-tagged,
-// older ones) is the oldest of the new batch and gets the next number up;
-// entries above it count upward toward the top (newest = highest number).
-// No duplicate self-heal here (unlike assignBacklogIds): a duplicate `#D`
-// is a cosmetic labeling glitch, not a broken lock — Done entries are never
-// claimed, so there is no correctness reason to repair it automatically.
-function assignDoneIds(path) {
-  if (!existsSync(path)) {
-    return false
-  }
-  const parts = readFileSync(path, 'utf8').split(/^## /m)
-
-  let maxD = 0
-  for (const part of parts) {
-    if (!part.startsWith('Done')) {
-      continue
-    }
-    for (const line of part.split('\n').slice(1)) {
-      const m = DONE_ID_TAG_RE.exec(line)
-      if (m) {
-        maxD = Math.max(maxD, Number(m[1]))
-      }
-    }
-  }
-
-  let changed = false
-  const newParts = parts.map((part) => {
-    if (!part.startsWith('Done')) {
-      return part
-    }
-    const lines = part.split('\n')
-    const untaggedIdx = []
-    for (let i = 1; i < lines.length; i++) {
-      const line = lines[i]
-      if (!/^- /.test(line)) {
-        continue
-      }
-      if (line.includes('_(completed work')) {
-        continue
-      }
-      if (DONE_ID_TAG_RE.test(line)) {
-        continue
-      }
-      // A CLAIM/RELEASE line that landed here instead of under
-      // `## In Progress` — easy to do, since both are hand-appended and the
-      // guidance is just "append". Tagging it would make a lock line look
-      // like completed work: it inflates the Done count, the release never
-      // takes effect, and the item stays locked until the TTL with nothing
-      // explaining why. Left untagged so `strayLockLines` can report it.
-      if (LOCK_LINE_RE.test(line)) {
-        continue
-      }
-      untaggedIdx.push(i)
-    }
-    if (!untaggedIdx.length) {
-      return part
-    }
-    changed = true
-    let counter = maxD
-    for (let k = untaggedIdx.length - 1; k >= 0; k--) {
-      counter += 1
-      const idx = untaggedIdx[k]
-      // Strip a leftover Backlog-style `#N` tag first — a Done entry that
-      // carries one over (e.g. copy-pasted from its own Backlog line
-      // instead of written as fresh prose) would otherwise end up
-      // double-tagged: `- \`#D5\` \`#2\` text` instead of `- \`#D5\` text`.
-      const rest = lines[idx].replace(/^-\s+/, '').replace(ID_TAG_RE_BODY, '')
-      lines[idx] = `- \`#D${counter}\` ${rest}`
-    }
-    maxD = counter
-    return lines.join('\n')
   })
 
   if (!changed) {
@@ -472,14 +448,16 @@ function bootstrap(root) {
   if (ensureInProgressSection(join(root, TODO_REL))) {
     made.push(`${TODO_REL} (added In Progress section)`)
   }
+  // One-time only: converts old `#D<n>` tags onto the unified `#N` scheme.
+  // Runs before assignIds so it never sees a legacy tag to worry about.
+  if (migrateLegacyDoneTags(join(root, TODO_REL))) {
+    made.push(`${TODO_REL} (migrated #D ids to unified #N scheme)`)
+  }
   // Runs every bootstrap, not just once: it also repairs duplicate ids from
   // concurrent additions, so it must fire on every SessionStart, not be
   // guarded like the one-shot migrations above it.
-  if (assignBacklogIds(join(root, TODO_REL))) {
-    made.push(`${TODO_REL} (assigned/repaired backlog ids)`)
-  }
-  if (assignDoneIds(join(root, TODO_REL))) {
-    made.push(`${TODO_REL} (numbered Done entries)`)
+  if (assignIds(join(root, TODO_REL))) {
+    made.push(`${TODO_REL} (assigned/repaired ids)`)
   }
   if (
     appendOnce(
@@ -596,7 +574,7 @@ function openItems(root) {
   return items.filter((i) => !i.text.includes('_(nothing yet'))
 }
 
-// The item's permanent `#N` id, assigned by assignBacklogIds during
+// The item's permanent `#N` id, assigned by assignIds during
 // bootstrap — this is the claim key. Returns null only for the rare
 // synthetic "see file for detail" item openItems() fabricates for a
 // prose-only section with no real bullet to tag.
@@ -619,10 +597,15 @@ function itemHash(text) {
 }
 
 // `## In Progress` lines:
-//   - CLAIM #N session <session-id> <ISO timestamp>
+//   - CLAIM #N session <session-id> <ISO timestamp> "optional label"
 //   - RELEASE #N session <session-id> <ISO timestamp>
 // Malformed lines are ignored rather than thrown on — a hand-edited or
 // partially-merged line must not crash the hook for every session after.
+//
+// Trailing quoted text on a CLAIM is an optional free-text label — what the
+// session is actually working on, not just who/when. More useful for a
+// future reader than a session id alone: a raw id says who, a label says
+// what.
 function parseLocks(root) {
   const path = join(root, TODO_REL)
   if (!existsSync(path)) {
@@ -637,11 +620,13 @@ function parseLocks(root) {
   const claims = []
   const releases = []
   for (const line of section.split('\n')) {
-    const c = line.match(/^-\s*CLAIM\s+#(\d+)\s+session\s+(\S+)\s+(\S+)/i)
+    const c = line.match(
+      /^-\s*CLAIM\s+#(\d+)\s+session\s+(\S+)\s+(\S+)(?:\s+"([^"]*)")?/i,
+    )
     if (c) {
       const ts = Date.parse(c[3])
       if (!Number.isNaN(ts)) {
-        claims.push({ id: Number(c[1]), session: c[2], ts })
+        claims.push({ id: Number(c[1]), session: c[2], ts, label: c[4] || null })
       }
       continue
     }
@@ -705,7 +690,7 @@ function strayLockLines(root) {
 // Returns { active: Map<id, {session, ts}>, conflicts: Array<{id, sessions}> }.
 function activeLocks(root, now) {
   const { claims, releases } = parseLocks(root)
-  const bySessionPerId = new Map() // id -> Map<session, latest ts among that session's active claims>
+  const bySessionPerId = new Map() // id -> Map<session, {ts, label} of that session's latest active claim>
   for (const c of claims) {
     const released = releases.some(
       (r) => r.id === c.id && r.session === c.session && r.ts >= c.ts,
@@ -718,9 +703,9 @@ function activeLocks(root, now) {
       bySessionPerId.set(c.id, new Map())
     }
     const bySession = bySessionPerId.get(c.id)
-    const currentTs = bySession.get(c.session)
-    if (currentTs === undefined || c.ts > currentTs) {
-      bySession.set(c.session, c.ts)
+    const current = bySession.get(c.session)
+    if (!current || c.ts > current.ts) {
+      bySession.set(c.session, { ts: c.ts, label: c.label })
     }
   }
 
@@ -730,13 +715,17 @@ function activeLocks(root, now) {
     if (bySession.size > 1) {
       conflicts.push({
         id,
-        sessions: [...bySession].map(([session, ts]) => ({ session, ts })),
+        sessions: [...bySession].map(([session, v]) => ({
+          session,
+          ts: v.ts,
+          label: v.label,
+        })),
       })
     }
     let winner = null
-    for (const [session, ts] of bySession) {
-      if (!winner || ts < winner.ts) {
-        winner = { session, ts }
+    for (const [session, v] of bySession) {
+      if (!winner || v.ts < winner.ts) {
+        winner = { session, ts: v.ts, label: v.label }
       }
     }
     active.set(id, winner)
@@ -852,7 +841,7 @@ if (mode === 'start') {
 
   const allItems = openItems(root)
   // id comes from the item's own permanent `#N` tag (assigned by
-  // assignBacklogIds above, before this read) — stable across sessions and
+  // assignIds above, before this read) — stable across sessions and
   // across edits to the item's own wording. Only the rare synthetic
   // "see file for detail" item (prose section, no real bullet) falls back
   // to a content hash, since there is no line to tag.
@@ -891,7 +880,10 @@ if (mode === 'start') {
           (c) =>
             `  #${c.id}: ` +
             c.sessions
-              .map((s) => `session ${s.session} (${new Date(s.ts).toISOString()})`)
+              .map((s) => {
+                const what = s.label ? ` — "${s.label}"` : ''
+                return `session ${s.session} (${new Date(s.ts).toISOString()}${what})`
+              })
               .join(' AND '),
         )
         .join('\n') +
@@ -960,7 +952,8 @@ if (mode === 'start') {
       ? ` In Progress elsewhere (hidden here): ${hidden
           .map((i) => {
             const lock = lockedByOthers.get(i.id)
-            return `#${i.id} (session ${lock.session}, since ${new Date(lock.ts).toISOString()})`
+            const what = lock.label ? ` — "${lock.label}"` : ''
+            return `#${i.id} (session ${lock.session}, since ${new Date(lock.ts).toISOString()}${what})`
           })
           .join(', ')}.`
       : ''
@@ -972,10 +965,12 @@ if (mode === 'start') {
         `Backlog items carried over from previous sessions (${TODO_REL}) — each is tagged with its permanent #id, ` +
         `safe to reference by that id across sessions. Resume from these, and update the file before it ends:` +
         `${body}${tail}\n\n` +
-        `Working on one of these concurrently with another session? Before starting, append under ` +
-        `"## In Progress" in ${TODO_REL}: \`- CLAIM #<id> session ${sessionId} ${new Date(now).toISOString()}\` ` +
-        `(use that session id and timestamp). Stopping early? Append a matching \`- RELEASE\` line to free it now ` +
-        `— otherwise it auto-expires after ${CLAIM_TTL_HOURS}h.`,
+        `Before starting real work on one of these, append under ` +
+        `"## In Progress" in ${TODO_REL}: \`- CLAIM #<id> session ${sessionId} ${new Date(now).toISOString()} ` +
+        `"<what you're about to do>"\` (quoted label optional but recommended — a future reader sees WHAT was ` +
+        `claimed, not just who/when) — mandatory, not just for concurrent sessions, since you can't know whether ` +
+        `another one is running. Release it with a matching \`- RELEASE\` line the moment you finish or abandon ` +
+        `it — don't rely on the ${CLAIM_TTL_HOURS}h auto-expiry, that's a crash backstop only.`,
     )
   } else if (hidden.length) {
     console.log(
