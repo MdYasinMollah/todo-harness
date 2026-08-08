@@ -200,6 +200,9 @@ function renameHeadingOnce(path, fromHeading, toHeading) {
 }
 
 const ID_TAG_RE = /^-\s+`#(\d+)`\s+(.*)$/
+// Same tag, without requiring the leading "- " — for stripping a leftover
+// Backlog id from text that's no longer a bullet's start (see assignDoneIds).
+const ID_TAG_RE_BODY = /^`#\d+`\s+/
 
 // Give every real Backlog bullet a permanent `#N` id — assigned once, never
 // renumbered, so it stays a valid reference (in conversation, in a CLAIM
@@ -337,7 +340,12 @@ function assignDoneIds(path) {
     for (let k = untaggedIdx.length - 1; k >= 0; k--) {
       counter += 1
       const idx = untaggedIdx[k]
-      lines[idx] = `- \`#D${counter}\` ${lines[idx].replace(/^-\s+/, '')}`
+      // Strip a leftover Backlog-style `#N` tag first — a Done entry that
+      // carries one over (e.g. copy-pasted from its own Backlog line
+      // instead of written as fresh prose) would otherwise end up
+      // double-tagged: `- \`#D5\` \`#2\` text` instead of `- \`#D5\` text`.
+      const rest = lines[idx].replace(/^-\s+/, '').replace(ID_TAG_RE_BODY, '')
+      lines[idx] = `- \`#D${counter}\` ${rest}`
     }
     maxD = counter
     return lines.join('\n')
