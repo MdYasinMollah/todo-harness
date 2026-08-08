@@ -11,11 +11,12 @@
 //
 // Never hard-fails: a broken hook must not be able to wedge a session.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { homedir } from 'node:os'
 import { join, resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { homedir } from 'node:os'
 
 const SELF = fileURLToPath(import.meta.url)
 // Set by Claude Code when this runs from an installed plugin. Distinguishes
@@ -25,9 +26,15 @@ const IS_PLUGIN = !!process.env.CLAUDE_PLUGIN_ROOT
 const TODO_DEFAULT = 'docs/TODO.md'
 const OPT_OUT = '.claude/no-todo-harness'
 const MARK = 'todo.mjs' // marker used to detect our hook entries in settings.json
+const CLAIM_TTL_HOURS = 2
+const CLAIM_TTL_MS = CLAIM_TTL_HOURS * 60 * 60 * 1000
 
 const git = (args, cwd) =>
-  execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  }).trim()
 
 // Project root = git toplevel. Returns null outside a repo (or when .git is
 // renamed away, as some deploy scripts do) so we never touch loose directories.
@@ -61,16 +68,44 @@ function todoRel(root) {
     const tracked = git(['ls-files', '--full-name'], root)
       .split('\n')
       .find((f) => f.toLowerCase().endsWith('/todo.md') || f.toLowerCase() === 'todo.md')
-    if (tracked) return tracked
+    if (tracked) {
+      return tracked
+    }
   } catch {
     // not a repo yet, or git unavailable — fall through
   }
   // Untracked but present (first session after someone created it by hand).
   for (const c of [TODO_DEFAULT, 'Docs/TODO.md', 'TODO.md']) {
-    if (existsSync(join(root, c))) return c
+    if (existsSync(join(root, c))) {
+      return c
+    }
   }
   return TODO_DEFAULT
 }
+
+// Own section, own migration function (ensureInProgressSection) so a repo
+// that bootstrapped before this existed gets it inserted without touching
+// Backlog/Done.
+const IN_PROGRESS_SECTION = `## In Progress
+
+Append-only session locks, keyed by each Backlog item's permanent \`#N\` id
+(assigned once, shown next to the item — never a content hash, so editing an
+item's wording never breaks its lock). Never edit or delete a line here —
+union merge can't reconcile in-place edits across sessions, only unioned
+appends. Formats:
+\`- CLAIM #N session <session-id> <timestamp>\`
+\`- RELEASE #N session <session-id> <timestamp>\` (optional, only if you stop
+early — a release from your own session cancels your own claim immediately)
+Locks auto-expire after ${CLAIM_TTL_HOURS} hours with no release needed.
+
+If a session that claimed something gets closed, crashes, or is deleted
+before finishing: don't wait out the timeout if you don't have to. The
+SessionStart message shows which session id holds a locked item — write a
+RELEASE line quoting THAT session's id (not your own) and it frees
+immediately. The ${CLAIM_TTL_HOURS}h expiry is only the backstop for when
+nobody notices.
+
+`
 
 const TEMPLATE = `# TODO — carried across sessions
 
@@ -80,11 +115,11 @@ blocked from ending a session that changed files but left this untouched.
 Write entries a teammate who wasn't here could act on: what's left and **where to
 resume**, not just a task name.
 
-## Open
+## Backlog
 
 - [ ] _(nothing yet — first session will fill this in)_
 
-## Done
+${IN_PROGRESS_SECTION}## Done
 
 _(completed work, newest first, with the date it landed)_
 `
@@ -95,19 +130,243 @@ const CLAUDE_SECTION = `## Cross-session TODO
 shared with the team through git. It is enforced by hooks, not by good intentions
 (\`.claude/hooks/todo.mjs\`, wired in \`.claude/settings.json\`):
 
-- **SessionStart** injects the open items into context.
+- **SessionStart** injects the backlog into context, minus any item another
+  session currently has locked (see \`## In Progress\` below).
 - **Stop** blocks the session from ending if it changed files but left
-  \`docs/TODO.md\` untouched. When blocked: record what's unfinished under \`## Open\`,
+  \`docs/TODO.md\` untouched. When blocked: record what's unfinished under \`## Backlog\`,
   move finished work to \`## Done\` with today's date, then finish.
+
+Each Backlog item carries a permanent \`#N\` id, assigned once and never
+reused or renumbered — safe to say "fix #7" in conversation even across
+sessions or days. Running multiple sessions on this repo at once? Before
+starting a Backlog item, append \`- CLAIM #N session <id> <timestamp>\` under
+\`## In Progress\` (the SessionStart message shows the exact line to copy), so
+the other session's next SessionStart hides it instead of duplicating the
+work. Stopping early? Append a matching \`- RELEASE\` line to free it right
+away — otherwise it auto-expires after ${CLAIM_TTL_HOURS}h on its own.
 
 \`.gitattributes\` sets \`merge=union\` on the file so parallel appends don't conflict.
 `
 
 function ensureFile(path, contents) {
-  if (existsSync(path)) return false
+  if (existsSync(path)) {
+    return false
+  }
   mkdirSync(dirname(path), { recursive: true })
   writeFileSync(path, contents)
   return true
+}
+
+// Migrate a repo bootstrapped before this section existed: insert it right
+// before "## Done" without touching Backlog/Done content. A structural
+// insert, not a same-line edit, so it is safe to run once even if a
+// teammate's clone does the same migration independently — guarded below.
+function ensureInProgressSection(path) {
+  if (!existsSync(path)) {
+    return false
+  }
+  const content = readFileSync(path, 'utf8')
+  if (/^## In Progress/m.test(content)) {
+    return false
+  }
+  if (!/^## Done/m.test(content)) {
+    writeFileSync(path, content.replace(/\s*$/, '\n\n') + IN_PROGRESS_SECTION)
+    return true
+  }
+  writeFileSync(path, content.replace(/^## Done/m, IN_PROGRESS_SECTION + '## Done'))
+  return true
+}
+
+// One-time heading rename for repos still on the old "## Open" / "## Claims"
+// names (including this repo's own docs/TODO.md, created before this rename).
+// Renames the heading LINE only — never touches item text below it — so it
+// is a structural edit, not the kind of same-line content edit merge=union
+// can't reconcile. Idempotent: no-ops once the new heading is already there.
+function renameHeadingOnce(path, fromHeading, toHeading) {
+  if (!existsSync(path)) {
+    return false
+  }
+  const content = readFileSync(path, 'utf8')
+  const toRe = new RegExp(`^## ${toHeading}\\s*$`, 'm')
+  if (toRe.test(content)) {
+    return false
+  }
+  const fromRe = new RegExp(`^## ${fromHeading}\\s*$`, 'm')
+  if (!fromRe.test(content)) {
+    return false
+  }
+  writeFileSync(path, content.replace(fromRe, `## ${toHeading}`))
+  return true
+}
+
+const ID_TAG_RE = /^-\s+`#(\d+)`\s+(.*)$/
+
+// Give every real Backlog bullet a permanent `#N` id — assigned once, never
+// renumbered, so it stays a valid reference (in conversation, in a CLAIM
+// line) even after the item's own wording is edited. Self-healing: also
+// repairs a duplicate id, which can only arise if two sessions each added a
+// brand-new item around the same time and both picked the same next number —
+// a much narrower race than the per-session claim race this whole feature
+// exists to prevent, and one this function fixes automatically on the very
+// next SessionStart rather than needing a real distributed lock.
+//
+// Operates on the `.split(/^## /m)` parts array (not string offsets) so
+// mutating one Backlog section's line lengths can't desync the position of
+// sections after it — the same trick `openItems` uses to survive multiple
+// `## Backlog — <topic>` headings.
+function assignBacklogIds(path) {
+  if (!existsSync(path)) {
+    return false
+  }
+  const parts = readFileSync(path, 'utf8').split(/^## /m)
+
+  let globalMax = 0
+  for (const part of parts) {
+    if (!part.startsWith('Backlog')) {
+      continue
+    }
+    for (const line of part.split('\n').slice(1)) {
+      const m = ID_TAG_RE.exec(line)
+      if (m) {
+        globalMax = Math.max(globalMax, Number(m[1]))
+      }
+    }
+  }
+
+  let changed = false
+  const usedIds = new Set()
+  let counter = globalMax
+  const newParts = parts.map((part) => {
+    if (!part.startsWith('Backlog')) {
+      return part
+    }
+    const lines = part.split('\n')
+    const newLines = lines.map((line, i) => {
+      if (i === 0 || !/^- /.test(line) || line.includes('_(nothing yet')) {
+        return line
+      }
+      const m = ID_TAG_RE.exec(line)
+      if (m) {
+        const id = Number(m[1])
+        if (!usedIds.has(id)) {
+          usedIds.add(id)
+          return line
+        }
+        // Duplicate — reassign past the known max, never colliding with
+        // any id already present anywhere in the file.
+        counter += 1
+        changed = true
+        return `- \`#${counter}\` ${m[2]}`
+      }
+      counter += 1
+      changed = true
+      return `- \`#${counter}\` ${line.replace(/^-\s+/, '')}`
+    })
+    return newLines.join('\n')
+  })
+
+  if (!changed) {
+    return false
+  }
+  writeFileSync(path, newParts.join('## '))
+  return true
+}
+
+const DONE_ID_TAG_RE = /^-\s+`#D(\d+)`\s+/
+
+// Tag every Done entry with a permanent `#D<n>`, oldest completed = `#D1`,
+// so "how much is actually done" is a number you can see, not a scroll.
+// A different tag shape than Backlog's `#N` on purpose — a Done id and a
+// Backlog id are never the same kind of reference, and reusing the same
+// counter would make "#2" ambiguous between "backlog item 2" and "the 2nd
+// thing ever finished."
+//
+// Numbering direction: the file lists Done newest-first (by convention), so
+// the newest entry is at the TOP. Untagged entries are always the newest
+// ones — anything already tagged is necessarily older, tagged on some prior
+// run — so the bottom-most untagged entry (closest to the already-tagged,
+// older ones) is the oldest of the new batch and gets the next number up;
+// entries above it count upward toward the top (newest = highest number).
+// No duplicate self-heal here (unlike assignBacklogIds): a duplicate `#D`
+// is a cosmetic labeling glitch, not a broken lock — Done entries are never
+// claimed, so there is no correctness reason to repair it automatically.
+function assignDoneIds(path) {
+  if (!existsSync(path)) {
+    return false
+  }
+  const parts = readFileSync(path, 'utf8').split(/^## /m)
+
+  let maxD = 0
+  for (const part of parts) {
+    if (!part.startsWith('Done')) {
+      continue
+    }
+    for (const line of part.split('\n').slice(1)) {
+      const m = DONE_ID_TAG_RE.exec(line)
+      if (m) {
+        maxD = Math.max(maxD, Number(m[1]))
+      }
+    }
+  }
+
+  let changed = false
+  const newParts = parts.map((part) => {
+    if (!part.startsWith('Done')) {
+      return part
+    }
+    const lines = part.split('\n')
+    const untaggedIdx = []
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i]
+      if (!/^- /.test(line)) {
+        continue
+      }
+      if (line.includes('_(completed work')) {
+        continue
+      }
+      if (DONE_ID_TAG_RE.test(line)) {
+        continue
+      }
+      untaggedIdx.push(i)
+    }
+    if (!untaggedIdx.length) {
+      return part
+    }
+    changed = true
+    let counter = maxD
+    for (let k = untaggedIdx.length - 1; k >= 0; k--) {
+      counter += 1
+      const idx = untaggedIdx[k]
+      lines[idx] = `- \`#D${counter}\` ${lines[idx].replace(/^-\s+/, '')}`
+    }
+    maxD = counter
+    return lines.join('\n')
+  })
+
+  if (!changed) {
+    return false
+  }
+  writeFileSync(path, newParts.join('## '))
+  return true
+}
+
+// Total finished entries — the answer to "how many gaps are already fixed,"
+// at a glance, without scrolling the whole Done log.
+function countDone(root) {
+  const path = join(root, TODO_REL)
+  if (!existsSync(path)) {
+    return 0
+  }
+  const section = readFileSync(path, 'utf8')
+    .split(/^## /m)
+    .find((s) => s.startsWith('Done'))
+  if (!section) {
+    return 0
+  }
+  return section
+    .split('\n')
+    .slice(1)
+    .filter((line) => /^- /.test(line) && !line.includes('_(completed work')).length
 }
 
 // `ci` for path needles: a repo tracking `Docs/TODO.md` that already has a
@@ -116,7 +375,9 @@ function ensureFile(path, contents) {
 function appendOnce(path, needle, block, ci = false) {
   const existing = existsSync(path) ? readFileSync(path, 'utf8') : ''
   const haystack = ci ? existing.toLowerCase() : existing
-  if (haystack.includes(ci ? needle.toLowerCase() : needle)) return false
+  if (haystack.includes(ci ? needle.toLowerCase() : needle)) {
+    return false
+  }
   writeFileSync(path, existing ? existing.replace(/\s*$/, '\n\n') + block : block)
   return true
 }
@@ -136,11 +397,19 @@ function patchSettings(root) {
   const cmd = (mode) => `node "$CLAUDE_PROJECT_DIR/.claude/hooks/todo.mjs" ${mode}`
   cfg.hooks ??= {}
   let changed = false
-  for (const [event, mode] of [['SessionStart', 'start'], ['Stop', 'stop']]) {
+  for (const [event, mode] of [
+    ['SessionStart', 'start'],
+    ['Stop', 'stop'],
+  ]) {
     cfg.hooks[event] ??= []
     const already = JSON.stringify(cfg.hooks[event]).includes(MARK)
-    if (already) continue
-    cfg.hooks[event].push({ matcher: '', hooks: [{ type: 'command', command: cmd(mode), timeout: 10 }] })
+    if (already) {
+      continue
+    }
+    cfg.hooks[event].push({
+      matcher: '',
+      hooks: [{ type: 'command', command: cmd(mode), timeout: 10 }],
+    })
     changed = true
   }
   if (changed) {
@@ -152,7 +421,30 @@ function patchSettings(root) {
 
 function bootstrap(root) {
   const made = []
-  if (ensureFile(join(root, TODO_REL), TEMPLATE)) made.push(TODO_REL)
+  if (ensureFile(join(root, TODO_REL), TEMPLATE)) {
+    made.push(TODO_REL)
+  }
+  // Renames run before ensureInProgressSection: a repo already on "## Claims"
+  // must be renamed to "## In Progress" in place, not left as-is while a
+  // second, empty "## In Progress" section gets inserted alongside it.
+  if (renameHeadingOnce(join(root, TODO_REL), 'Open', 'Backlog')) {
+    made.push(`${TODO_REL} (renamed Open → Backlog)`)
+  }
+  if (renameHeadingOnce(join(root, TODO_REL), 'Claims', 'In Progress')) {
+    made.push(`${TODO_REL} (renamed Claims → In Progress)`)
+  }
+  if (ensureInProgressSection(join(root, TODO_REL))) {
+    made.push(`${TODO_REL} (added In Progress section)`)
+  }
+  // Runs every bootstrap, not just once: it also repairs duplicate ids from
+  // concurrent additions, so it must fire on every SessionStart, not be
+  // guarded like the one-shot migrations above it.
+  if (assignBacklogIds(join(root, TODO_REL))) {
+    made.push(`${TODO_REL} (assigned/repaired backlog ids)`)
+  }
+  if (assignDoneIds(join(root, TODO_REL))) {
+    made.push(`${TODO_REL} (numbered Done entries)`)
+  }
   if (
     appendOnce(
       join(root, '.gitattributes'),
@@ -162,9 +454,12 @@ function bootstrap(root) {
         `${TODO_REL} merge=union\n`,
       true, // case-insensitive: don't duplicate a stale docs/ vs Docs/ line
     )
-  )
+  ) {
     made.push('.gitattributes')
-  if (appendOnce(join(root, 'CLAUDE.md'), 'Cross-session TODO', CLAUDE_SECTION)) made.push('CLAUDE.md')
+  }
+  if (appendOnce(join(root, 'CLAUDE.md'), 'Cross-session TODO', CLAUDE_SECTION)) {
+    made.push('CLAUDE.md')
+  }
 
   // Vendor this script into the repo so teammates inherit the harness on clone.
   //
@@ -180,7 +475,9 @@ function bootstrap(root) {
       copyFileSync(SELF, vendored)
       made.push('.claude/hooks/todo.mjs')
     }
-    if (patchSettings(root)) made.push('.claude/settings.json')
+    if (patchSettings(root)) {
+      made.push('.claude/settings.json')
+    }
   }
   return made
 }
@@ -194,36 +491,46 @@ function bootstrap(root) {
 // spend 25KB. Each item is also clipped, so one essay cannot eat the budget
 // and starve the items below it.
 const MAX_INJECT_CHARS = 6000 // ~1.5k tokens
-const MAX_ITEM_CHARS = 300    // enough to identify the task and its file paths
+const MAX_ITEM_CHARS = 300 // enough to identify the task and its file paths
 
 // First sentence (or hard clip) — enough to recognise the item and decide
 // whether to open the file, without carrying its full rationale.
 function clip(text, max = MAX_ITEM_CHARS) {
-  if (text.length <= max) return text
+  if (text.length <= max) {
+    return text
+  }
   const cut = text.slice(0, max)
-  const stop = Math.max(cut.lastIndexOf('. '), cut.lastIndexOf(' — '), cut.lastIndexOf('; '))
+  const stop = Math.max(
+    cut.lastIndexOf('. '),
+    cut.lastIndexOf(' — '),
+    cut.lastIndexOf('; '),
+  )
   return (stop > max * 0.5 ? cut.slice(0, stop + 1) : cut.trimEnd()) + ' […]'
 }
 
-// Open items, with wrapped continuation lines folded back into one line each.
+// Backlog items, with wrapped continuation lines folded back into one line each.
 //
-// Collects EVERY `## Open*` section, not just the first. `.find()` here used to
-// silently discard the rest, so adding a second `## Open — <topic>` heading
+// Collects EVERY `## Backlog*` section, not just the first. `.find()` here used
+// to silently discard the rest, so adding a second `## Backlog — <topic>` heading
 // above the main backlog hid 350+ lines of real work from every session.
 function openItems(root) {
   const path = join(root, TODO_REL)
-  if (!existsSync(path)) return null
+  if (!existsSync(path)) {
+    return null
+  }
   const sections = readFileSync(path, 'utf8')
     .split(/^## /m)
-    .filter((s) => s.startsWith('Open'))
-  if (!sections.length) return []
+    .filter((s) => s.startsWith('Backlog'))
+  if (!sections.length) {
+    return []
+  }
 
   const items = []
   for (const section of sections) {
     const lines = section.split('\n')
-    // Heading text, so an item from `## Open — auth audit` is attributable
-    // once merged with items from other Open sections.
-    const topic = lines[0].replace(/^Open\s*[—-]?\s*/, '').trim()
+    // Heading text, so an item from `## Backlog — auth audit` is attributable
+    // once merged with items from other Backlog sections.
+    const topic = lines[0].replace(/^Backlog\s*[—-]?\s*/, '').trim()
     const before = items.length
     let collecting = false
 
@@ -251,6 +558,89 @@ function openItems(root) {
   }
 
   return items.filter((i) => !i.text.includes('_(nothing yet'))
+}
+
+// The item's permanent `#N` id, assigned by assignBacklogIds during
+// bootstrap — this is the claim key. Returns null only for the rare
+// synthetic "see file for detail" item openItems() fabricates for a
+// prose-only section with no real bullet to tag.
+function parseItemId(text) {
+  const m = ID_TAG_RE.exec(text)
+  return m ? Number(m[1]) : null
+}
+
+// Fallback identity for the id-less synthetic items above — content hash,
+// same as the id system's first version. Not claimable in practice (nothing
+// in the file to attach a `#N` tag to), but still needs a stable-ish key so
+// it doesn't crash the display path.
+function itemHash(text) {
+  const normalized = text
+    .replace(/^[-*]\s*(\[[ xX]\]\s*)?/, '')
+    .trim()
+    .toLowerCase()
+    .slice(0, 60)
+  return createHash('sha1').update(normalized).digest('hex').slice(0, 8)
+}
+
+// `## In Progress` lines:
+//   - CLAIM #N session <session-id> <ISO timestamp>
+//   - RELEASE #N session <session-id> <ISO timestamp>
+// Malformed lines are ignored rather than thrown on — a hand-edited or
+// partially-merged line must not crash the hook for every session after.
+function parseLocks(root) {
+  const path = join(root, TODO_REL)
+  if (!existsSync(path)) {
+    return { claims: [], releases: [] }
+  }
+  const section = readFileSync(path, 'utf8')
+    .split(/^## /m)
+    .find((s) => s.startsWith('In Progress'))
+  if (!section) {
+    return { claims: [], releases: [] }
+  }
+  const claims = []
+  const releases = []
+  for (const line of section.split('\n')) {
+    const c = line.match(/^-\s*CLAIM\s+#(\d+)\s+session\s+(\S+)\s+(\S+)/i)
+    if (c) {
+      const ts = Date.parse(c[3])
+      if (!Number.isNaN(ts)) {
+        claims.push({ id: Number(c[1]), session: c[2], ts })
+      }
+      continue
+    }
+    const r = line.match(/^-\s*RELEASE\s+#(\d+)\s+session\s+(\S+)\s+(\S+)/i)
+    if (r) {
+      const ts = Date.parse(r[3])
+      if (!Number.isNaN(ts)) {
+        releases.push({ id: Number(r[1]), session: r[2], ts })
+      }
+    }
+  }
+  return { claims, releases }
+}
+
+// Current lock holder per item id, or none if released/expired. A release
+// from the SAME session at/after the claim's timestamp cancels it outright —
+// that's the escape hatch for a session that grabs an item then decides not
+// to do it, instead of it sitting locked for the full TTL. Map<id, {session, ts}>.
+function activeLocks(root, now) {
+  const { claims, releases } = parseLocks(root)
+  const active = new Map()
+  for (const c of claims) {
+    const released = releases.some(
+      (r) => r.id === c.id && r.session === c.session && r.ts >= c.ts,
+    )
+    const expired = now - c.ts >= CLAIM_TTL_MS
+    if (released || expired) {
+      continue
+    }
+    const current = active.get(c.id)
+    if (!current || c.ts > current.ts) {
+      active.set(c.id, { session: c.session, ts: c.ts })
+    }
+  }
+  return active
 }
 
 function changedFiles(root) {
@@ -281,11 +671,15 @@ function recentlyCommitted(root, rel, n = 10) {
     // No pathspec here on purpose: `git log -nN -- <path>` counts N commits
     // *that touched the path*, which would match however far back it was and
     // pass forever. We want "did any of the last N commits touch it".
-    const out = execFileSync('git', ['log', `-n${n}`, '--name-only', '--pretty=format:'], {
-      cwd: root,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
+    const out = execFileSync(
+      'git',
+      ['log', `-n${n}`, '--name-only', '--pretty=format:'],
+      {
+        cwd: root,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      },
+    )
     return out.split('\n').some((l) => l.trim().toLowerCase() === rel.toLowerCase())
   } catch {
     return false
@@ -346,84 +740,143 @@ if (mode === 'start') {
   if (made.length) {
     console.log(
       `Bootstrapped the cross-session TODO harness for this project: ${made.join(', ')}. ` +
-        `Commit these so teammates inherit it. The backlog lives at ${TODO_REL} and stays project-local.`
+        `Commit these so teammates inherit it. The backlog lives at ${TODO_REL} and stays project-local.`,
     )
   }
-  const items = openItems(root)
+  const input = readStdin()
+  // Falls back to a pid-based id when the hook input carries no session_id
+  // (older Claude Code builds, or a manual test invocation) — still unique
+  // enough to tell "my claim" from "someone else's" within one run.
+  const sessionId = input.session_id || `pid${process.pid}`
+
+  const allItems = openItems(root)
+  // id comes from the item's own permanent `#N` tag (assigned by
+  // assignBacklogIds above, before this read) — stable across sessions and
+  // across edits to the item's own wording. Only the rare synthetic
+  // "see file for detail" item (prose section, no real bullet) falls back
+  // to a content hash, since there is no line to tag.
+  if (allItems) {
+    allItems.forEach((i) => {
+      i.id = parseItemId(i.text)
+      if (i.id === null) {
+        i.hash = itemHash(i.text)
+      }
+    })
+  }
+
+  const now = Date.now()
+  const locks = activeLocks(root, now)
+  const lockedByOthers = new Map(
+    [...locks].filter(([, lock]) => lock.session !== sessionId),
+  )
+  const items = allItems
+    ? allItems.filter((i) => i.id === null || !lockedByOthers.has(i.id))
+    : allItems
+  const hidden = allItems ? allItems.filter((i) => !items.includes(i)) : []
+  const summary =
+    `Status: ${allItems ? allItems.length : 0} Backlog item(s) ` +
+    `(${hidden.length} In Progress elsewhere), ${countDone(root)} Done.`
+
   if (items && items.length) {
     // Clip each item, then take as many as fit the budget.
     const shown = []
     let spent = 0
     for (const item of items) {
       const text = clip(item.text)
-      if (spent + text.length > MAX_INJECT_CHARS) break
-      shown.push({ topic: item.topic, text })
+      if (spent + text.length > MAX_INJECT_CHARS) {
+        break
+      }
+      shown.push({ topic: item.topic, text, id: item.id, hash: item.hash })
       spent += text.length
     }
 
-    // Number CONTINUOUSLY across sections, not per-section: the number is a
-    // handle the user says out loud ("do item 7"), so it has to be unique in
-    // the whole list, not just within one heading. Assigned before grouping so
-    // it reflects file order rather than group order.
-    //
-    // Numbers live only in this injection, never in TODO.md itself: the file
-    // is `merge=union` in .gitattributes, and hand-numbered lists renumber
-    // every item below an insert — which is exactly the shape that conflicts.
-    shown.forEach((item, i) => {
-      item.n = i + 1
-    })
-
-    // Group under their headings so multiple `## Open — <topic>` sections stay
-    // distinguishable once flattened into one list.
+    // Group under their headings so multiple `## Backlog — <topic>` sections
+    // stay distinguishable once flattened into one list.
     const byTopic = new Map()
     for (const item of shown) {
       const key = item.topic || 'General'
-      if (!byTopic.has(key)) byTopic.set(key, [])
+      if (!byTopic.has(key)) {
+        byTopic.set(key, [])
+      }
       byTopic.get(key).push(item)
     }
     const body = [...byTopic]
       .map(([topic, group]) => {
         const lines = group
-          // Swap the leading `- ` for `N. ` — the source stays a plain bullet.
-          .map((it) => `${it.n}. ${it.text.replace(/^-\s*/, '')}`)
+          // `#N` is the item's permanent id — stable across sessions, safe to
+          // say "fix #7" days later. Strip the raw `` `#N` `` tag from the
+          // displayed text itself so it isn't shown twice.
+          .map((it) => {
+            const label = it.id !== null ? `#${it.id}` : `[${it.hash}]`
+            // ID_TAG_RE needs the leading "- " still in place to match, so
+            // it must run BEFORE the plain-bullet strip below (which would
+            // otherwise remove that "- " first and make the tag unmatchable).
+            const text = it.text.replace(ID_TAG_RE, '$2').replace(/^-\s*/, '')
+            return `${label} ${text}`
+          })
           .join('\n')
         return `\n### ${topic}\n${lines}`
       })
       .join('\n')
 
     const omitted = items.length - shown.length
+    const hiddenNote = hidden.length
+      ? ` In Progress elsewhere (hidden here): ${hidden
+          .map((i) => {
+            const lock = lockedByOthers.get(i.id)
+            return `#${i.id} (session ${lock.session}, since ${new Date(lock.ts).toISOString()})`
+          })
+          .join(', ')}.`
+      : ''
     const tail = omitted
-      ? `\n\n(+${omitted} more open item(s) not shown, and entries above are truncated — read ${TODO_REL} for the full backlog.)`
-      : `\n\n(Entries may be truncated — read ${TODO_REL} for full detail.)`
+      ? `\n\n(+${omitted} more backlog item(s) not shown, and entries above are truncated — read ${TODO_REL} for the full backlog.${hiddenNote})`
+      : `\n\n(Entries may be truncated — read ${TODO_REL} for full detail.${hiddenNote})`
     console.log(
-      `Open items carried over from previous sessions (${TODO_REL}), numbered ${shown[0].n}–${shown[shown.length - 1].n} ` +
-        `in file order — you can refer to them by number this session. Resume from these, and update the file before it ends:` +
-        `${body}${tail}`
+      `${summary}\n\n` +
+        `Backlog items carried over from previous sessions (${TODO_REL}) — each is tagged with its permanent #id, ` +
+        `safe to reference by that id across sessions. Resume from these, and update the file before it ends:` +
+        `${body}${tail}\n\n` +
+        `Working on one of these concurrently with another session? Before starting, append under ` +
+        `"## In Progress" in ${TODO_REL}: \`- CLAIM #<id> session ${sessionId} ${new Date(now).toISOString()}\` ` +
+        `(use that session id and timestamp). Stopping early? Append a matching \`- RELEASE\` line to free it now ` +
+        `— otherwise it auto-expires after ${CLAIM_TTL_HOURS}h.`,
+    )
+  } else if (hidden.length) {
+    console.log(
+      `${summary}\n\n${TODO_REL}: no backlog items available — ${hidden.length} item(s) currently In Progress in another active session.`,
     )
   } else {
-    console.log(`${TODO_REL}: no open items.`)
+    console.log(`${summary}\n\n${TODO_REL}: no backlog items.`)
   }
   process.exit(0)
 }
 
 if (mode === 'stop') {
   const input = readStdin()
-  if (input.stop_hook_active) process.exit(0) // already blocked once; never twice
+  if (input.stop_hook_active) {
+    process.exit(0)
+  } // already blocked once; never twice
 
   const changed = changedFiles(root)
-  if (!changed || changed.length === 0) process.exit(0)
+  if (!changed || changed.length === 0) {
+    process.exit(0)
+  }
   // Case-insensitive: this repo tracks the file as `Docs/TODO.md`, and
   // `git status --porcelain` reports the tracked spelling, so a case-sensitive
   // endsWith() never matches and the stop is blocked forever no matter how
   // many times the backlog is actually updated.
-  if (changed.some((f) => f.toLowerCase().endsWith(TODO_REL.toLowerCase()))) process.exit(0)
-  if (recentlyCommitted(root, TODO_REL)) process.exit(0)
+  if (changed.some((f) => f.toLowerCase().endsWith(TODO_REL.toLowerCase()))) {
+    process.exit(0)
+  }
+  if (recentlyCommitted(root, TODO_REL)) {
+    process.exit(0)
+  }
 
   console.error(
     `This session changed ${changed.length} file(s) but left ${TODO_REL} untouched.\n` +
-      `Before finishing: record what is still unfinished under "## Open", and move anything ` +
+      `Before finishing: record what is still unfinished under "## Backlog", and move anything ` +
       `completed to "## Done" with today's date. Then stop again.\n` +
-      `Changed: ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ', …' : ''}`
+      `Changed: ${changed.slice(0, 10).join(', ')}${changed.length > 10 ? ', …' : ''}`,
   )
   process.exit(2) // exit 2 = block the stop, feed stderr back to Claude
 }
