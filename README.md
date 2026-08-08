@@ -127,6 +127,17 @@ Both lines are **append-only** — never edit or delete a line under
 appends from two branches always combine cleanly, but a same-line edit from
 each side does not.
 
+**On the race this can't prevent:** two sessions starting at the same instant
+can still both see an item unclaimed and both write a `CLAIM` line before
+either sees the other's — there's no lock that spans two independent sessions
+here, only a file. This can't be eliminated, so instead of letting it fail
+silently (one claim quietly "winning" while the other duplicates work), the
+next `SessionStart` for *either* session detects it and prints an unmissable
+warning naming both sessions and timestamps, so a human decides who
+continues. The earliest claimant is still treated as the effective holder for
+every *other* session's filtering — the warning is for the two sessions in
+conflict, not a reason to change what everyone else sees.
+
 ## Rules that keep it working
 
 - **Write items as `- ` bullets.** A section written as prose injects only its

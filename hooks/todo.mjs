@@ -631,10 +631,22 @@ function parseLocks(root) {
 // Current lock holder per item id, or none if released/expired. A release
 // from the SAME session at/after the claim's timestamp cancels it outright —
 // that's the escape hatch for a session that grabs an item then decides not
-// to do it, instead of it sitting locked for the full TTL. Map<id, {session, ts}>.
+// to do it, instead of it sitting locked for the full TTL.
+//
+// Two sessions claiming the same id before either has seen the other's
+// claim (the one race this file-based design cannot prevent — no lock
+// spans two sessions starting at the same instant) is detected here, not
+// silently resolved: `active` still needs exactly one winner so other
+// sessions know what's taken (earliest claim wins — first writer, not last
+// writer, since "last" would mean a session's own claim can be evicted by
+// someone else's later one without it ever finding out). `conflicts` carries
+// every id with more than one distinct session actively claiming it, so the
+// affected sessions get a loud warning instead of quietly duplicating work.
+//
+// Returns { active: Map<id, {session, ts}>, conflicts: Array<{id, sessions}> }.
 function activeLocks(root, now) {
   const { claims, releases } = parseLocks(root)
-  const active = new Map()
+  const bySessionPerId = new Map() // id -> Map<session, latest ts among that session's active claims>
   for (const c of claims) {
     const released = releases.some(
       (r) => r.id === c.id && r.session === c.session && r.ts >= c.ts,
@@ -643,12 +655,34 @@ function activeLocks(root, now) {
     if (released || expired) {
       continue
     }
-    const current = active.get(c.id)
-    if (!current || c.ts > current.ts) {
-      active.set(c.id, { session: c.session, ts: c.ts })
+    if (!bySessionPerId.has(c.id)) {
+      bySessionPerId.set(c.id, new Map())
+    }
+    const bySession = bySessionPerId.get(c.id)
+    const currentTs = bySession.get(c.session)
+    if (currentTs === undefined || c.ts > currentTs) {
+      bySession.set(c.session, c.ts)
     }
   }
-  return active
+
+  const active = new Map()
+  const conflicts = []
+  for (const [id, bySession] of bySessionPerId) {
+    if (bySession.size > 1) {
+      conflicts.push({
+        id,
+        sessions: [...bySession].map(([session, ts]) => ({ session, ts })),
+      })
+    }
+    let winner = null
+    for (const [session, ts] of bySession) {
+      if (!winner || ts < winner.ts) {
+        winner = { session, ts }
+      }
+    }
+    active.set(id, winner)
+  }
+  return { active, conflicts }
 }
 
 function changedFiles(root) {
@@ -773,7 +807,7 @@ if (mode === 'start') {
   }
 
   const now = Date.now()
-  const locks = activeLocks(root, now)
+  const { active: locks, conflicts } = activeLocks(root, now)
   const lockedByOthers = new Map(
     [...locks].filter(([, lock]) => lock.session !== sessionId),
   )
@@ -784,6 +818,26 @@ if (mode === 'start') {
   const summary =
     `Status: ${allItems ? allItems.length : 0} Backlog item(s) ` +
     `(${hidden.length} In Progress elsewhere), ${countDone(root)} Done.`
+
+  // Two sessions can still claim the same item before either sees the
+  // other's line — no file-based lock spans two sessions starting at the
+  // same instant. This can't be prevented, only surfaced loudly instead of
+  // silently letting one claim win and the other quietly duplicate work.
+  // Shown to EVERY session (including the two conflicting ones — they may
+  // not know their own claim collided) via a leading, unmissable line.
+  const conflictWarning = conflicts.length
+    ? `⚠ CLAIM CONFLICT — coordinate before continuing, only one should proceed:\n` +
+      conflicts
+        .map(
+          (c) =>
+            `  #${c.id}: ` +
+            c.sessions
+              .map((s) => `session ${s.session} (${new Date(s.ts).toISOString()})`)
+              .join(' AND '),
+        )
+        .join('\n') +
+      `\n\n`
+    : ''
 
   if (items && items.length) {
     // Clip each item, then take as many as fit the budget.
@@ -840,7 +894,7 @@ if (mode === 'start') {
       ? `\n\n(+${omitted} more backlog item(s) not shown, and entries above are truncated — read ${TODO_REL} for the full backlog.${hiddenNote})`
       : `\n\n(Entries may be truncated — read ${TODO_REL} for full detail.${hiddenNote})`
     console.log(
-      `${summary}\n\n` +
+      `${conflictWarning}${summary}\n\n` +
         `Backlog items carried over from previous sessions (${TODO_REL}) — each is tagged with its permanent #id, ` +
         `safe to reference by that id across sessions. Resume from these, and update the file before it ends:` +
         `${body}${tail}\n\n` +
@@ -851,10 +905,10 @@ if (mode === 'start') {
     )
   } else if (hidden.length) {
     console.log(
-      `${summary}\n\n${TODO_REL}: no backlog items available — ${hidden.length} item(s) currently In Progress in another active session.`,
+      `${conflictWarning}${summary}\n\n${TODO_REL}: no backlog items available — ${hidden.length} item(s) currently In Progress in another active session.`,
     )
   } else {
-    console.log(`${summary}\n\n${TODO_REL}: no backlog items.`)
+    console.log(`${conflictWarning}${summary}\n\n${TODO_REL}: no backlog items.`)
   }
   process.exit(0)
 }
