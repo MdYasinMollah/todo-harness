@@ -41,11 +41,11 @@ those so teammates inherit the convention.
 
 ## In Progress
 
-- CLAIM #2 session abc123 2026-08-08T14:00:00.000Z
+- CLAIM #2 session abc123 2026-08-08T14:00:00.000Z "fixing the last dashboard step"
 
 ## Done
 
-- `#D1` **2026-08-07** Shipped the export route. Charges once per deed via a
+- `#4` **2026-08-07** Shipped the export route. Charges once per deed via a
   partial unique index.
 ```
 
@@ -77,24 +77,31 @@ numbers were positional, injected fresh each session, and would drift the
 moment something above them was marked done. That rule still holds for
 *positional* numbers.
 
-This version assigns a **permanent** id instead: `` `#N` `` for Backlog,
-`` `#DN` `` for Done (oldest completed = `#D1`). It's written into the item's
-own line once, at creation, and never reassigned — editing the item's wording
-later doesn't change its id. This is what makes two things possible that
-positional numbering can't do:
+This version assigns a **permanent** id instead: `` `#N` ``, from **one
+shared sequence across both Backlog and Done** — not a separate format for
+each. Written into the item's own line once, at creation, and never
+reassigned — editing the item's wording later doesn't change its id, and
+completing it doesn't relabel it: a Backlog item keeps the exact number it
+already had once it's moved to Done. This is what makes two things possible
+that positional numbering can't do:
 
 - **Multi-session locking** (below) needs a key for an item that survives the
   item's own text being edited mid-claim.
 - **A stable reference** — "fix #7" means the same thing next week, which a
   number recomputed fresh every session start cannot promise.
 
-The id is assigned by the hook itself (`assignBacklogIds`/`assignDoneIds`,
-run every `SessionStart`), not hand-typed, so it doesn't reintroduce the
-original problem (manually renumbering a list on every insert). If two
-sessions each add a new item around the same moment and pick the same next
-id — the one race this can't prevent outright — the very next `SessionStart`
-detects the duplicate and reassigns it past the current max automatically.
-Narrower race, self-healing, no distributed lock required.
+(An earlier iteration of this feature used a second tag shape, `` `#DN` ``,
+for Done specifically. Dropped in favor of one format everywhere — two shapes
+to keep straight was worse than the ambiguity it was solving. A repo carrying
+old `#DN` tags migrates them onto the unified scheme automatically.)
+
+The id is assigned by the hook itself (`assignIds`, run every `SessionStart`),
+not hand-typed, so it doesn't reintroduce the original problem (manually
+renumbering a list on every insert). If two sessions each add a new item
+around the same moment and pick the same next id — the one race this can't
+prevent outright — the very next `SessionStart` detects the duplicate and
+reassigns it past the current max automatically. Narrower race, self-healing,
+no distributed lock required.
 
 ## Multi-session locking
 
@@ -102,8 +109,12 @@ Running more than one Claude session against the same repo? Before starting a
 Backlog item, append under `## In Progress`:
 
 ```
-- CLAIM #<id> session <session-id> <ISO timestamp>
+- CLAIM #<id> session <session-id> <ISO timestamp> "optional label"
 ```
+
+The quoted label is optional but recommended — a session id alone tells a
+future reader *who* claimed something, not *what* they were doing; the label
+is what makes the log worth reading back later.
 
 The next `SessionStart` in any other session hides that item instead of
 picking it up too. Stopping early? Free it right away instead of waiting out
@@ -153,9 +164,8 @@ the edit `merge=union` can't reconcile — that part is yours to do).
   what it *is*, then the rationale.
 - **Move finished work to `## Done`.** Struck-through items left under
   `## Backlog` spend injection budget and push real work past the cap.
-- **Don't hand-edit a `` `#N` `` or `` `#DN` `` tag once assigned.** They're
-  meant to be permanent; the hook assigns and repairs them, you shouldn't
-  need to.
+- **Don't hand-edit a `` `#N` `` tag once assigned.** It's meant to be
+  permanent; the hook assigns and repairs them, you shouldn't need to.
 
 `## Done` costs nothing beyond a one-line count: full entries never enter
 context. Don't prune it to save tokens — keep it for the history.
@@ -188,10 +198,12 @@ the tracked spelling instead of assumed.
 
 ## Upgrading from an older backlog file
 
-A repo still on the old `## Open` / `## Claims` names, or with no ids at all,
-migrates automatically and idempotently on the next `SessionStart` — headings
-are renamed in place, ids are assigned to existing items, nothing is deleted
-or reordered. Safe to run even if two clones migrate independently.
+A repo still on the old `## Open` / `## Claims` names, with no ids at all, or
+carrying old `` `#DN` `` Done tags, migrates automatically and idempotently on
+the next `SessionStart` — headings are renamed in place (suffix preserved:
+`## Open — active` → `## Backlog — active`), ids are assigned or converted,
+nothing is deleted or reordered. Safe to run even if two clones migrate
+independently.
 
 ## Opting out
 
