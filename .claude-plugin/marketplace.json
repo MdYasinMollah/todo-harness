@@ -1,0 +1,15 @@
+{
+  "name": "todo-harness",
+  "version": "1.0.0",
+  "description": "Cross-session TODO backlog for Claude Code, enforced by hooks.",
+  "owner": {
+    "name": "Yasin Mollah"
+  },
+  "plugins": [
+    {
+      "name": "todo-harness",
+      "source": "./",
+      "description": "SessionStart injects the project's open items — numbered, grouped and budget-capped; Stop blocks a session that changed files but left the backlog untouched. The backlog is a committed Markdown file, shared with the team through git."
+    }
+  ]
+}
