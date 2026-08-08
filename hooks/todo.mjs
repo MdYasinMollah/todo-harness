@@ -182,20 +182,28 @@ function ensureInProgressSection(path) {
 // Renames the heading LINE only — never touches item text below it — so it
 // is a structural edit, not the kind of same-line content edit merge=union
 // can't reconcile. Idempotent: no-ops once the new heading is already there.
+//
+// Keeps any suffix: `## Open — active (work on these now)` becomes
+// `## Backlog — active (work on these now)`. Anchoring this to a bare
+// `^## Open$` instead was a silent backlog-eater — the documented convention
+// is multiple `## Open — <topic>` sections, so the rename would no-op on a
+// real file while openItems moved on to looking for `## Backlog`, and every
+// item in the repo would vanish from the injection with no error.
+//
+// Renames EVERY match, not just the first, for the same reason openItems
+// collects every section: a file with both `## Open — active` and
+// `## Open — backlog` must not come out half-migrated.
 function renameHeadingOnce(path, fromHeading, toHeading) {
   if (!existsSync(path)) {
     return false
   }
   const content = readFileSync(path, 'utf8')
-  const toRe = new RegExp(`^## ${toHeading}\\s*$`, 'm')
-  if (toRe.test(content)) {
-    return false
-  }
-  const fromRe = new RegExp(`^## ${fromHeading}\\s*$`, 'm')
+  const fromRe = new RegExp(`^## ${fromHeading}([ \\t]*(?:[—-][^\\n]*)?)$`, 'gm')
   if (!fromRe.test(content)) {
     return false
   }
-  writeFileSync(path, content.replace(fromRe, `## ${toHeading}`))
+  fromRe.lastIndex = 0
+  writeFileSync(path, content.replace(fromRe, `## ${toHeading}$1`))
   return true
 }
 
