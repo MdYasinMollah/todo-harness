@@ -6,12 +6,15 @@ good intentions.
 Claude forgets everything between sessions. The usual fix — "remember to write
 notes" — fails the moment a session ends in a hurry. This makes it structural:
 
-- **SessionStart** injects the project's open items into context, numbered and
-  budget-capped, so a new session resumes where the last one stopped.
+- **SessionStart** injects the project's backlog into context — grouped,
+  budget-capped, and minus anything another active session already has
+  locked — so a new session resumes where the last one stopped, without
+  duplicating work someone else is mid-way through.
 - **Stop** blocks a session that changed files but left the backlog untouched.
 
 The backlog is a plain Markdown file committed to the repo, so it is shared
-with the team through git — not stored in anyone's local Claude state.
+with the team through git — not stored in anyone's local Claude state, and
+safe for several sessions (or several people) to work against at once.
 
 ## Install
 
@@ -27,38 +30,102 @@ those so teammates inherit the convention.
 ## The backlog file
 
 ```markdown
-## Open — active
+## Backlog — active
 
-- **Ship the export route.** Blocked on the font licence question.
-- **Password reset.** Code done; one dashboard step left.
+- `#1` **Ship the export route.** Blocked on the font licence question.
+- `#2` **Password reset.** Code done; one dashboard step left.
 
-## Open — backlog
+## Backlog — later
 
-- **Refactor the PDF layer.** Not scheduled; notes in Docs/pdf.md.
+- `#3` **Refactor the PDF layer.** Not scheduled; notes in Docs/pdf.md.
 
-## Done (2026-08-07) — export route
+## In Progress
 
-- Shipped. Charges once per deed via a partial unique index.
+- CLAIM #2 session abc123 2026-08-08T14:00:00.000Z
+
+## Done
+
+- `#D1` **2026-08-07** Shipped the export route. Charges once per deed via a
+  partial unique index.
 ```
 
-Every heading starting with `## Open` is collected; `## Done` never is. Two
-sections are conventional — **active** and **backlog** — with active first, so
-the low numbers are always live work.
+Every heading starting with `## Backlog` is collected; `## In Progress` and
+`## Done` never are. Multiple `## Backlog — <topic>` sections are conventional
+for splitting active work from a longer-term list.
 
 At session start that becomes:
 
 ```
-Open items carried over from previous sessions (docs/TODO.md), numbered 1–3 …
+Status: 2 Backlog item(s) (1 In Progress elsewhere), 1 Done.
+
+Backlog items carried over from previous sessions (docs/TODO.md) — each is
+tagged with its permanent #id, safe to reference by that id across sessions:
 
 ### active
-1. **Ship the export route.** Blocked on the font licence question.
-2. **Password reset.** Code done; one dashboard step left.
+#1 **Ship the export route.** Blocked on the font licence question.
 
-### backlog
-3. **Refactor the PDF layer.** Not scheduled; notes in Docs/pdf.md.
+(In Progress elsewhere (hidden here): #2 (session abc123, since ...).)
 ```
 
-You can then say "do item 2" and be understood.
+You can then say "do #1" and be understood — today, next week, or in a
+completely different session.
+
+## Item ids — and a deliberate break from the old rule
+
+Earlier versions of this harness said "never number items in the file" —
+numbers were positional, injected fresh each session, and would drift the
+moment something above them was marked done. That rule still holds for
+*positional* numbers.
+
+This version assigns a **permanent** id instead: `` `#N` `` for Backlog,
+`` `#DN` `` for Done (oldest completed = `#D1`). It's written into the item's
+own line once, at creation, and never reassigned — editing the item's wording
+later doesn't change its id. This is what makes two things possible that
+positional numbering can't do:
+
+- **Multi-session locking** (below) needs a key for an item that survives the
+  item's own text being edited mid-claim.
+- **A stable reference** — "fix #7" means the same thing next week, which a
+  number recomputed fresh every session start cannot promise.
+
+The id is assigned by the hook itself (`assignBacklogIds`/`assignDoneIds`,
+run every `SessionStart`), not hand-typed, so it doesn't reintroduce the
+original problem (manually renumbering a list on every insert). If two
+sessions each add a new item around the same moment and pick the same next
+id — the one race this can't prevent outright — the very next `SessionStart`
+detects the duplicate and reassigns it past the current max automatically.
+Narrower race, self-healing, no distributed lock required.
+
+## Multi-session locking
+
+Running more than one Claude session against the same repo? Before starting a
+Backlog item, append under `## In Progress`:
+
+```
+- CLAIM #<id> session <session-id> <ISO timestamp>
+```
+
+The next `SessionStart` in any other session hides that item instead of
+picking it up too. Stopping early? Free it right away instead of waiting out
+the expiry:
+
+```
+- RELEASE #<id> session <session-id> <ISO timestamp>
+```
+
+Locks auto-expire after 2 hours with no release needed — the constant is
+`CLAIM_TTL_HOURS` at the top of `hooks/todo.mjs`.
+
+**If a session crashes or gets closed/deleted mid-claim:** don't wait out the
+timeout. The SessionStart message for other sessions shows exactly which
+session id holds the lock — write a `RELEASE` line quoting *that* session's
+id (not your own) and it frees immediately. The 2h expiry is only the
+backstop for when nobody notices.
+
+Both lines are **append-only** — never edit or delete a line under
+`## In Progress`. That's what keeps this safe under `merge=union`: unioned
+appends from two branches always combine cleanly, but a same-line edit from
+each side does not.
 
 ## Rules that keep it working
 
@@ -66,14 +133,14 @@ You can then say "do item 2" and be understood.
   heading — its content is silently lost.
 - **Front-load each item.** Only the first ~300 chars are injected: lead with
   what it *is*, then the rationale.
-- **Move finished work to a `## Done` heading.** Struck-through items left
-  under `## Open` spend injection budget and push real work past the cap.
-- **Never number items in the file.** Numbers are positional and would
-  renumber on every insert — precisely what conflicts under `merge=union`.
-  The hook numbers the injection instead.
+- **Move finished work to `## Done`.** Struck-through items left under
+  `## Backlog` spend injection budget and push real work past the cap.
+- **Don't hand-edit a `` `#N` `` or `` `#DN` `` tag once assigned.** They're
+  meant to be permanent; the hook assigns and repairs them, you shouldn't
+  need to.
 
-`## Done` costs nothing: it never enters context. Don't prune it to save
-tokens — keep it for the history.
+`## Done` costs nothing beyond a one-line count: full entries never enter
+context. Don't prune it to save tokens — keep it for the history.
 
 ## Budget
 
@@ -84,6 +151,7 @@ of `hooks/todo.mjs`:
 |---|---|---|
 | `MAX_INJECT_CHARS` | 6000 (~1.5k tokens) | Total injection budget |
 | `MAX_ITEM_CHARS` | 300 | Per-item clip, at a sentence boundary |
+| `CLAIM_TTL_HOURS` | 2 | How long a lock holds before auto-expiring |
 
 Budgeting by characters rather than item count is deliberate: a handful of
 long prose entries can otherwise spend 25 KB before the rest are reached.
@@ -99,6 +167,13 @@ case-sensitively, and `existsSync` is case-sensitive on Linux, so a hardcoded
 `docs/` in a repo tracking `Docs/` fails **silently** — no error, just an
 inert `merge=union` line and an empty injection on CI. Both are resolved from
 the tracked spelling instead of assumed.
+
+## Upgrading from an older backlog file
+
+A repo still on the old `## Open` / `## Claims` names, or with no ids at all,
+migrates automatically and idempotently on the next `SessionStart` — headings
+are renamed in place, ids are assigned to existing items, nothing is deleted
+or reordered. Safe to run even if two clones migrate independently.
 
 ## Opting out
 
