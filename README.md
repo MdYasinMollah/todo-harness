@@ -133,10 +133,21 @@ session id holds the lock — write a `RELEASE` line quoting *that* session's
 id (not your own) and it frees immediately. The 2h expiry is only the
 backstop for when nobody notices.
 
-Both lines are **append-only** — never edit or delete a line under
-`## In Progress`. That's what keeps this safe under `merge=union`: unioned
-appends from two branches always combine cleanly, but a same-line edit from
-each side does not.
+**When the item is fully finished:** delete its CLAIM/RELEASE line(s)
+entirely, in the same edit that writes the `## Done` entry — the Done entry
+is now the permanent record, so the lock lines are pure clutter once
+resolved. This is the one deliberate exception to append-only, and it's safe
+specifically because it's a single coordinated edit by the session that just
+finished the item, not a routine action or something racing anyone else. If
+you're only pausing an item that's still open, `RELEASE` but leave the pair —
+it's a progress trail for whoever resumes it next.
+
+Both lines are otherwise **append-only** — don't edit or delete a lock line
+for any other reason. That's what keeps this safe under `merge=union`:
+unioned appends from two branches always combine cleanly, but a same-line
+edit from each side does not, and routine deletion risks the same problem
+(one branch's delete can be silently undone by a union merge with a branch
+that never saw it).
 
 **On the race this can't prevent:** two sessions starting at the same instant
 can still both see an item unclaimed and both write a `CLAIM` line before

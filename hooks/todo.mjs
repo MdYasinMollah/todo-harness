@@ -100,6 +100,14 @@ The quoted label is optional but recommended: a future reader sees WHAT was
 claimed, not just who/when — a session id alone answers "who," not "why."
 Locks auto-expire after ${CLAIM_TTL_HOURS} hours with no release needed.
 
+When the item is fully finished (moved to \`## Done\`): delete its CLAIM/
+RELEASE line(s) from here entirely, in the same edit that writes the Done
+entry — the Done entry is now the permanent record, the lock lines are pure
+clutter once resolved. Safe specifically because it's one coordinated edit
+by the session that just finished it, not a routine action or a race with
+anyone. If only pausing an item that's still open, RELEASE but leave the
+pair — it's a progress trail for whoever resumes it next.
+
 If a session that claimed something gets closed, crashes, or is deleted
 before finishing: don't wait out the timeout if you don't have to. The
 SessionStart message shows which session id holds a locked item — write a
@@ -149,9 +157,15 @@ item, append
 \`- CLAIM #N session <id> <timestamp> "what you're about to do"\` under
 \`## In Progress\` (the SessionStart message shows the exact line to copy; the
 quoted label is optional but recommended — it's what makes the log useful
-later, not just who/when). Stopping early? Append a matching \`- RELEASE\`
-line to free it right away — otherwise it auto-expires after
-${CLAIM_TTL_HOURS}h on its own.
+later, not just who/when). When it's fully finished, DELETE its CLAIM/
+RELEASE line(s) from \`## In Progress\` entirely, in the same edit that
+writes its \`## Done\` entry — the Done entry is now the permanent record, so
+the lock lines are pure clutter (safe here specifically because it's one
+coordinated edit by the session that just finished it). If only pausing an
+item that's still open, \`RELEASE\` instead but leave the pair in place — a
+progress trail for whoever resumes it next. Abandoning it early? Same rule:
+\`RELEASE\` immediately — the ${CLAIM_TTL_HOURS}h auto-expiry is a crash
+backstop, not a substitute for releasing.
 
 \`.gitattributes\` sets \`merge=union\` on the file so parallel appends don't conflict.
 `
