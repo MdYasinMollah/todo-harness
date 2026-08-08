@@ -138,6 +138,13 @@ continues. The earliest claimant is still treated as the effective holder for
 every *other* session's filtering — the warning is for the two sessions in
 conflict, not a reason to change what everyone else sees.
 
+**Put lock lines under `## In Progress`, nowhere else.** Only that section is
+read, so a `CLAIM` or `RELEASE` appended to the wrong one does nothing — and
+a misfiled `RELEASE` is the bad case: the item stays locked for the full TTL
+with nothing saying why. Easy to do by hand, so `SessionStart` reports any it
+finds outside the section and leaves them untouched (moving a line is exactly
+the edit `merge=union` can't reconcile — that part is yours to do).
+
 ## Rules that keep it working
 
 - **Write items as `- ` bullets.** A section written as prose injects only its

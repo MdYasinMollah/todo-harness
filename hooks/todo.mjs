@@ -276,6 +276,10 @@ function assignBacklogIds(path) {
 }
 
 const DONE_ID_TAG_RE = /^-\s+`#D(\d+)`\s+/
+// A CLAIM/RELEASE line, wherever it landed. These belong under
+// `## In Progress`; the same shape appearing under any other heading is a
+// misfiled lock line, not content — see assignDoneIds and strayLockLines.
+const LOCK_LINE_RE = /^-\s*(?:CLAIM|RELEASE)\s+#\d+\s+session\s+/i
 
 // Tag every Done entry with a permanent `#D<n>`, oldest completed = `#D1`,
 // so "how much is actually done" is a number you can see, not a scroll.
@@ -330,6 +334,15 @@ function assignDoneIds(path) {
       if (DONE_ID_TAG_RE.test(line)) {
         continue
       }
+      // A CLAIM/RELEASE line that landed here instead of under
+      // `## In Progress` — easy to do, since both are hand-appended and the
+      // guidance is just "append". Tagging it would make a lock line look
+      // like completed work: it inflates the Done count, the release never
+      // takes effect, and the item stays locked until the TTL with nothing
+      // explaining why. Left untagged so `strayLockLines` can report it.
+      if (LOCK_LINE_RE.test(line)) {
+        continue
+      }
       untaggedIdx.push(i)
     }
     if (!untaggedIdx.length) {
@@ -374,7 +387,14 @@ function countDone(root) {
   return section
     .split('\n')
     .slice(1)
-    .filter((line) => /^- /.test(line) && !line.includes('_(completed work')).length
+    .filter(
+      (line) =>
+        /^- /.test(line) &&
+        !line.includes('_(completed work') &&
+        // A misfiled CLAIM/RELEASE line is not completed work; counting it
+        // would overstate Done for as long as it sits here.
+        !LOCK_LINE_RE.test(line),
+    ).length
 }
 
 // `ci` for path needles: a repo tracking `Docs/TODO.md` that already has a
@@ -628,6 +648,37 @@ function parseLocks(root) {
   return { claims, releases }
 }
 
+// CLAIM/RELEASE lines that landed outside `## In Progress`. parseLocks only
+// reads that one section, so a misfiled lock line is otherwise inert: a
+// CLAIM never locks, and — worse — a RELEASE never frees, leaving the item
+// held for the full TTL with no visible reason. Both lines are hand-appended
+// to a file whose own instruction is "append", so this is a slip worth
+// catching rather than assuming away. Reported, never auto-moved: relocating
+// a line is the one edit `merge=union` cannot reconcile across branches.
+function strayLockLines(root) {
+  const path = join(root, TODO_REL)
+  if (!existsSync(path)) {
+    return []
+  }
+  const stray = []
+  for (const part of readFileSync(path, 'utf8').split(/^## /m)) {
+    if (part.startsWith('In Progress')) {
+      continue
+    }
+    const heading = part.split('\n')[0].trim()
+    for (const line of part.split('\n').slice(1)) {
+      // Match the tagged form too: an earlier version tagged these as Done
+      // entries, so a repo upgrading from it can have `- \`#D7\` CLAIM #2 …`
+      // already written into the file.
+      const bare = line.replace(/^-\s+`#D?\d+`\s+/, '- ')
+      if (LOCK_LINE_RE.test(bare)) {
+        stray.push({ heading: heading || '(top of file)', line: line.trim() })
+      }
+    }
+  }
+  return stray
+}
+
 // Current lock holder per item id, or none if released/expired. A release
 // from the SAME session at/after the claim's timestamp cancels it outright —
 // that's the escape hatch for a session that grabs an item then decides not
@@ -839,6 +890,21 @@ if (mode === 'start') {
       `\n\n`
     : ''
 
+  // A misfiled CLAIM/RELEASE is silent by construction — parseLocks reads
+  // only `## In Progress`, so the line does nothing and nothing says why.
+  // Prefixed onto the same warning block as conflicts so every output path
+  // below carries it.
+  const stray = strayLockLines(root)
+  const strayWarning = stray.length
+    ? `⚠ MISFILED LOCK LINE — these CLAIM/RELEASE lines are outside "## In Progress", ` +
+      `so they have no effect (a CLAIM does not lock; a RELEASE does not free). ` +
+      `Move each under "## In Progress" by hand:\n` +
+      stray.map((s) => `  under "## ${s.heading}": ${s.line}`).join('\n') +
+      `\n\n`
+    : ''
+
+  const warnings = `${strayWarning}${conflictWarning}`
+
   if (items && items.length) {
     // Clip each item, then take as many as fit the budget.
     const shown = []
@@ -894,7 +960,7 @@ if (mode === 'start') {
       ? `\n\n(+${omitted} more backlog item(s) not shown, and entries above are truncated — read ${TODO_REL} for the full backlog.${hiddenNote})`
       : `\n\n(Entries may be truncated — read ${TODO_REL} for full detail.${hiddenNote})`
     console.log(
-      `${conflictWarning}${summary}\n\n` +
+      `${warnings}${summary}\n\n` +
         `Backlog items carried over from previous sessions (${TODO_REL}) — each is tagged with its permanent #id, ` +
         `safe to reference by that id across sessions. Resume from these, and update the file before it ends:` +
         `${body}${tail}\n\n` +
@@ -905,10 +971,10 @@ if (mode === 'start') {
     )
   } else if (hidden.length) {
     console.log(
-      `${conflictWarning}${summary}\n\n${TODO_REL}: no backlog items available — ${hidden.length} item(s) currently In Progress in another active session.`,
+      `${warnings}${summary}\n\n${TODO_REL}: no backlog items available — ${hidden.length} item(s) currently In Progress in another active session.`,
     )
   } else {
-    console.log(`${conflictWarning}${summary}\n\n${TODO_REL}: no backlog items.`)
+    console.log(`${warnings}${summary}\n\n${TODO_REL}: no backlog items.`)
   }
   process.exit(0)
 }
