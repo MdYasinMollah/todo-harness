@@ -297,15 +297,23 @@ function assignIds(path) {
   const parts = readFileSync(path, 'utf8').split(/^## /m)
   const isTaggable = (part) => part.startsWith('Backlog') || part.startsWith('Done')
 
+  // Scan EVERY backtick-wrapped `#<digits>` tag on a taggable line, not just
+  // the leading one — a line corrupted by the stacking bug below can carry
+  // several, and under-counting globalMax here is exactly what let that bug
+  // re-collide and re-stack on every subsequent run. Deliberately requires
+  // the backticks (real id tags are always written that way) rather than
+  // matching bare `#<digits>` anywhere in a line — entry text sometimes
+  // cites an external issue number in prose (e.g. "jestjs/jest#15923"), and
+  // a bare match would misread that as an enormous real id and inflate
+  // every id assigned afterward.
   let globalMax = 0
   for (const part of parts) {
     if (!isTaggable(part)) {
       continue
     }
     for (const line of part.split('\n').slice(1)) {
-      const m = ID_TAG_RE.exec(line)
-      if (m) {
-        globalMax = Math.max(globalMax, Number(m[1]))
+      for (const hit of line.matchAll(/`#(\d+)`/g)) {
+        globalMax = Math.max(globalMax, Number(hit[1]))
       }
     }
   }
@@ -328,24 +336,150 @@ function assignIds(path) {
       ) {
         return line
       }
-      const m = ID_TAG_RE.exec(line)
-      if (m) {
-        const id = Number(m[1])
+      // A line can carry a run of several stacked `#N` tags — the fossil of
+      // a bug where a reassignment prepended a fresh id onto the line
+      // WITHOUT stripping the stale one(s) already there, so every later
+      // collision added yet another instead of replacing the last. The
+      // oldest, real id is always the last tag in the run (each pass
+      // prepended, never appended); everything before it is stacking noise
+      // from earlier re-collisions. Collapse to that one canonical id and
+      // drop the rest, here, every run, so a line can never re-accumulate
+      // even if a future bug reintroduces collisions.
+      const stackMatch = /^-\s+((?:`#\d+`\s*)+)(.*)$/.exec(line)
+      if (stackMatch) {
+        const ids = [...stackMatch[1].matchAll(/#(\d+)/g)].map((h) => Number(h[1]))
+        const id = ids[ids.length - 1]
+        const rest = stackMatch[2]
+        const wasStacked = ids.length > 1
         if (!usedIds.has(id)) {
           usedIds.add(id)
+          if (wasStacked) {
+            changed = true
+            return `- \`#${id}\` ${rest}`
+          }
           return line
         }
-        // Duplicate — reassign past the known max, never colliding with
-        // any id already present anywhere in the file.
+        // True duplicate (two independent items really do share an id) —
+        // reassign past the known max, never colliding with any id already
+        // present anywhere in the file.
         counter += 1
         changed = true
-        return `- \`#${counter}\` ${m[2]}`
+        return `- \`#${counter}\` ${rest}`
       }
       counter += 1
       changed = true
       return `- \`#${counter}\` ${line.replace(/^-\s+/, '')}`
     })
     return newLines.join('\n')
+  })
+
+  if (!changed) {
+    return false
+  }
+  writeFileSync(path, newParts.join('## '))
+  return true
+}
+
+// Splits a taggable section's body (everything after its own heading line)
+// into whole entries: a `- ` line at column 0 plus every following line up
+// to the next column-0 `- ` line. Shared by dedupeEntries and anything else
+// that needs to walk entries as units instead of raw lines.
+function splitEntries(sectionBody) {
+  const lines = sectionBody.split('\n')
+  const heading = lines[0]
+  const entries = []
+  let current = null
+  for (const line of lines.slice(1)) {
+    if (/^- /.test(line)) {
+      if (current) entries.push(current)
+      current = [line]
+    } else if (current) {
+      current.push(line)
+    } else {
+      entries.push([line])
+      current = null
+    }
+  }
+  if (current) entries.push(current)
+  return { heading, entries }
+}
+
+// Removes duplicate Backlog/Done entries — the fossil of `docs/TODO.md`
+// carrying `merge=union` in .gitattributes (see bootstrap below): that
+// strategy avoids merge CONFLICTS on this append-heavy shared file by
+// keeping every line from both sides of a merge, but it has no concept of
+// "these two sides wrote the same entry" — it unions lines, not content, so
+// two sessions (or two machines) independently recording the same finished
+// item, or a merge landing both a mid-write and a since-completed copy of
+// one entry, both survive as literal duplicate paragraphs. Runs every
+// bootstrap, same reasoning as assignIds: it must self-heal on every
+// SessionStart, not just once, since more merges keep happening.
+//
+// Two passes, both content-based (ids stripped before comparing, so a
+// duplicate with a different id still matches):
+//   1. Exact — same fingerprint, keep the first occurrence.
+//   2. Prefix — one entry's full text is a strict prefix of another's (a
+//      mid-write snapshot vs. its later completed version); keep only the
+//      longest. Safe: a strict-prefix relationship can never discard
+//      content unique to the shorter copy.
+function dedupeEntries(path) {
+  if (!existsSync(path)) {
+    return false
+  }
+  const parts = readFileSync(path, 'utf8').split(/^## /m)
+  const isTaggable = (part) => part.startsWith('Backlog') || part.startsWith('Done')
+  const fingerprint = (entryLines) =>
+    entryLines
+      .join('\n')
+      .replace(/`#\d+`/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+
+  let changed = false
+  const newParts = parts.map((part) => {
+    if (!isTaggable(part)) {
+      return part
+    }
+    const { heading, entries } = splitEntries(part)
+
+    const seen = new Set()
+    const stage1 = []
+    for (const entryLines of entries) {
+      const fp = fingerprint(entryLines)
+      if (fp.length > 0 && seen.has(fp)) {
+        changed = true
+        continue
+      }
+      if (fp.length > 0) {
+        seen.add(fp)
+      }
+      stage1.push({ entryLines, fp })
+    }
+
+    const droppedIdx = new Set()
+    for (let i = 0; i < stage1.length; i++) {
+      if (droppedIdx.has(i)) {
+        continue
+      }
+      for (let j = 0; j < stage1.length; j++) {
+        if (i === j || droppedIdx.has(j)) {
+          continue
+        }
+        const a = stage1[i].fp
+        const b = stage1[j].fp
+        if (a.length === 0 || b.length === 0 || a === b) {
+          continue
+        }
+        if (b.startsWith(a) && b.length > a.length) {
+          droppedIdx.add(i)
+          changed = true
+          break
+        }
+      }
+    }
+
+    const kept = stage1.filter((_, i) => !droppedIdx.has(i)).map((s) => s.entryLines)
+    return [heading, ...kept.flat()].join('\n')
   })
 
   if (!changed) {
@@ -459,12 +593,22 @@ function bootstrap(root) {
   if (assignIds(join(root, TODO_REL))) {
     made.push(`${TODO_REL} (assigned/repaired ids)`)
   }
+  // Also every bootstrap, same reasoning — merge=union (below) keeps
+  // re-introducing duplicate entries on every merge between concurrent
+  // sessions/machines, so this has to keep re-cleaning them, not run once.
+  if (dedupeEntries(join(root, TODO_REL))) {
+    made.push(`${TODO_REL} (removed duplicate entries)`)
+  }
   if (
     appendOnce(
       join(root, '.gitattributes'),
       TODO_REL,
       `# Shared append-heavy backlog: keep both sides on merge instead of conflicting.\n` +
         `# Path is case-sensitive to git — it must match the tracked spelling.\n` +
+        `# Tradeoff: union keeps lines, not content — two sessions/machines recording\n` +
+        `# the same entry (or a merge landing both a mid-write and a completed copy)\n` +
+        `# survives as a literal duplicate. This hook's dedupeEntries() runs every\n` +
+        `# SessionStart specifically to clean this back up automatically.\n` +
         `${TODO_REL} merge=union\n`,
       true, // case-insensitive: don't duplicate a stale docs/ vs Docs/ line
     )
