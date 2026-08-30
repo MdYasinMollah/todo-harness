@@ -384,6 +384,15 @@ function assignIds(path) {
 // into whole entries: a `- ` line at column 0 plus every following line up
 // to the next column-0 `- ` line. Shared by dedupeEntries and anything else
 // that needs to walk entries as units instead of raw lines.
+//
+// The blank line(s) trailing the very last entry (the gap before the next
+// `## ` heading) are returned separately as `tail` rather than folded into
+// that entry's own lines — they're section structure, not entry content.
+// Folding them in used to mean dropping the last entry as an exact/prefix
+// duplicate silently deleted the section's trailing blank line too, which
+// glued the next section's `## ` heading onto the previous entry's text on
+// rejoin. Only whitespace-only trailing lines are pulled out — a real
+// continuation line (e.g. "  Verified: ...") stays part of its entry.
 function splitEntries(sectionBody) {
   const lines = sectionBody.split('\n')
   const heading = lines[0]
@@ -401,7 +410,18 @@ function splitEntries(sectionBody) {
     }
   }
   if (current) entries.push(current)
-  return { heading, entries }
+
+  let tail = []
+  const last = entries[entries.length - 1]
+  if (last) {
+    let cut = last.length
+    while (cut > 0 && last[cut - 1].trim() === '') {
+      cut -= 1
+    }
+    tail = last.slice(cut)
+    entries[entries.length - 1] = last.slice(0, cut)
+  }
+  return { heading, entries, tail }
 }
 
 // Removes duplicate Backlog/Done entries — the fossil of `docs/TODO.md`
@@ -440,7 +460,7 @@ function dedupeEntries(path) {
     if (!isTaggable(part)) {
       return part
     }
-    const { heading, entries } = splitEntries(part)
+    const { heading, entries, tail } = splitEntries(part)
 
     const seen = new Set()
     const stage1 = []
@@ -479,7 +499,7 @@ function dedupeEntries(path) {
     }
 
     const kept = stage1.filter((_, i) => !droppedIdx.has(i)).map((s) => s.entryLines)
-    return [heading, ...kept.flat()].join('\n')
+    return [heading, ...kept.flat(), ...tail].join('\n')
   })
 
   if (!changed) {
